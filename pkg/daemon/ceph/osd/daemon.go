@@ -358,10 +358,6 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			continue
 		}
 
-		// skipAvailabilityCheck is set when a device has existing LVM structures
-		// but should be included for ceph-volume batch (OSD replacement scenario).
-		skipAvailabilityCheck := false
-
 		// Ignore device with filesystem signature since c-v inventory
 		// cannot detect that correctly
 		// see: https://tracker.ceph.com/issues/43585
@@ -385,13 +381,6 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 				// Device is an LVM PV but explicitly requested. This happens when a device
 				// has existing Ceph LVM structures (e.g., OSD replacement scenario).
 				logger.Infof("allowing LVM device %q because it is explicitly requested", device.Name)
-				if agent.metadataDevice != "" {
-					// When a metadata device is configured, this device likely has an existing OSD.
-					// Skip the availability check so it can be passed to ceph-volume batch,
-					// which will detect the existing OSD and skip it.
-					skipAvailabilityCheck = true
-					logger.Infof("skipping availability check for device %q (will be passed to ceph-volume batch with metadata device)", device.Name)
-				}
 			} else {
 				logger.Infof("skipping device %q because it contains a filesystem %q", device.Name, device.Filesystem)
 				continue
@@ -451,15 +440,11 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			}
 		}
 
-		if !skipAvailabilityCheck && !isAvailable {
+		if !isAvailable {
 			logger.Infof("skipping device %q: %s.", device.Name, rejectedReason)
 			continue
 		}
-		if skipAvailabilityCheck {
-			logger.Infof("device %q included for batch processing (existing OSD with metadata device).", device.Name)
-		} else {
-			logger.Infof("device %q is available.", device.Name)
-		}
+		logger.Infof("device %q is available.", device.Name)
 
 		if device.Type == sys.PartType && agent.storeConfig.EncryptedDevice {
 			logger.Infof("partition %q is not picked because encrypted OSD on partition is not allowed", device.Name)

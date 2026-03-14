@@ -1942,8 +1942,8 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-			// Handle pvs calls from getExistingCephVG
-			if command == "pvs" {
+			// Handle nsenter LVM calls from getExistingCephVG
+			if command == nsenterCmd {
 				return "", nil
 			}
 			// First command
@@ -1999,8 +1999,8 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-			// Handle pvs calls from getExistingCephVG
-			if command == "pvs" {
+			// Handle nsenter LVM calls from getExistingCephVG
+			if command == nsenterCmd {
 				return "", nil
 			}
 			// First command
@@ -2054,8 +2054,8 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-			// Handle pvs calls from getExistingCephVG
-			if command == "pvs" {
+			// Handle nsenter LVM calls from getExistingCephVG
+			if command == nsenterCmd {
 				return "", nil
 			}
 			// First command
