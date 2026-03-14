@@ -197,6 +197,11 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 		if err != nil {
 			return errors.Wrap(err, "failed initial hardware discovery")
 		}
+
+		// Re-add explicitly requested devices that were skipped due to LVM children.
+		// This handles the OSD replacement scenario where a device has orphaned LVM
+		// structures from a previously purged OSD.
+		rawDevices = ensureDesiredDevicesInInventory(context, agent.devices, rawDevices)
 	}
 
 	context.Devices = rawDevices
@@ -374,6 +379,11 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 
 			} else if device.Filesystem == "mpath_member" && agent.pvcBacked {
 				logger.Infof("allowing multipath disk %q with filesystem %q", device.Name, device.Filesystem)
+			} else if device.Filesystem == "LVM2_member" && isDeviceExplicitlyRequested(device.Name, desiredDevices) {
+				// Device is an LVM PV but explicitly requested. This happens during OSD
+				// replacement when a device has orphaned Ceph LVM structures from a
+				// previously purged OSD. Allow it through for further processing.
+				logger.Infof("allowing LVM device %q with filesystem %q because it is explicitly requested", device.Name, device.Filesystem)
 			} else {
 				logger.Infof("skipping device %q because it contains a filesystem %q", device.Name, device.Filesystem)
 				continue
@@ -624,4 +634,73 @@ func GetOSDInfoById(context *clusterd.Context, clusterInfo *client.ClusterInfo, 
 	}
 
 	return nil, fmt.Errorf("failed to get details for OSD %d using ceph-volume list", osdID)
+}
+
+// isDeviceExplicitlyRequested checks if a device is explicitly listed in the desired devices
+// (not a filter or pathFilter). Handles /dev/ prefix normalization.
+func isDeviceExplicitlyRequested(deviceName string, desiredDevices []DesiredDevice) bool {
+	for _, desired := range desiredDevices {
+		if desired.IsFilter || desired.IsDevicePathFilter {
+			continue
+		}
+		desiredName := strings.TrimPrefix(desired.Name, "/dev/")
+		if desiredName == deviceName || desired.Name == deviceName {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureDesiredDevicesInInventory adds explicitly requested devices back to the inventory
+// if they were skipped during discovery due to having LVM children. This handles the OSD
+// replacement scenario where a data device has orphaned LVM structures from a purged OSD.
+func ensureDesiredDevicesInInventory(context *clusterd.Context, desiredDevices []DesiredDevice, rawDevices []*sys.LocalDisk) []*sys.LocalDisk {
+	inventoryDevices := make(map[string]bool, len(rawDevices))
+	for _, d := range rawDevices {
+		inventoryDevices[d.Name] = true
+	}
+
+	for _, desired := range desiredDevices {
+		if desired.IsFilter || desired.IsDevicePathFilter || desired.Name == "all" {
+			continue
+		}
+
+		deviceName := strings.TrimPrefix(desired.Name, "/dev/")
+		if inventoryDevices[deviceName] {
+			continue
+		}
+
+		devicePath := desired.Name
+		if !strings.HasPrefix(devicePath, "/dev/") {
+			devicePath = "/dev/" + devicePath
+		}
+
+		props, err := sys.GetDevicePropertiesFromPath(devicePath, context.Executor)
+		if err != nil {
+			logger.Warningf("failed to probe explicitly requested device %q: %v", devicePath, err)
+			continue
+		}
+
+		var size uint64
+		if sizeStr, ok := props["SIZE"]; ok {
+			if parsed, err := fmt.Sscanf(sizeStr, "%d", &size); err != nil || parsed == 0 {
+				logger.Warningf("failed to parse size %q for device %q", sizeStr, devicePath)
+			}
+		}
+
+		disk := &sys.LocalDisk{
+			Name:        deviceName,
+			RealPath:    devicePath,
+			Type:        sys.DiskType,
+			HasChildren: true,
+			Size:        size,
+			Filesystem:  props["FSTYPE"],
+		}
+
+		logger.Infof("adding explicitly requested device %q to inventory (was skipped due to LVM children)", deviceName)
+		rawDevices = append(rawDevices, disk)
+		inventoryDevices[deviceName] = true
+	}
+
+	return rawDevices
 }

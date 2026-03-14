@@ -32,6 +32,7 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	apps "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -97,6 +98,108 @@ func TestOSDHealthCheck(t *testing.T) {
 	// Check if the osd deployment was deleted
 	dp, _ = context.Clientset.AppsV1().Deployments(clusterInfo.Namespace).List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("%v=%d", OsdIdLabelKey, 0)})
 	assert.Equal(t, 0, len(dp.Items))
+}
+
+func TestLogOSDDeviceInfo(t *testing.T) {
+	ctx := context.TODO()
+	clientset := testexec.New(t, 2)
+	clusterInfo := client.AdminTestClusterInfo("fake")
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			return "", nil
+		},
+	}
+	c := &clusterd.Context{
+		Executor:  executor,
+		Clientset: clientset,
+	}
+
+	osdMon := NewOSDHealthMonitor(c, clusterInfo, false, cephv1.CephClusterHealthCheckSpec{})
+
+	t.Run("OSD with data and metadata device", func(t *testing.T) {
+		labels := map[string]string{
+			k8sutil.AppAttr:     AppName,
+			k8sutil.ClusterAttr: clusterInfo.Namespace,
+			OsdIdLabelKey:       "0",
+		}
+		deployment := &apps.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-osd-0",
+				Namespace: clusterInfo.Namespace,
+				Labels:    labels,
+			},
+			Spec: apps.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "osd",
+								Env: []corev1.EnvVar{
+									{Name: "ROOK_BLOCK_PATH", Value: "/dev/ceph-vg/osd-block-uuid"},
+									{Name: "ROOK_METADATA_DEVICE", Value: "nvme0n1"},
+									{Name: "ROOK_NODE_NAME", Value: "worker-1"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		_, err := c.Clientset.AppsV1().Deployments(clusterInfo.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Should log without panicking
+		osdMon.logOSDDeviceInfo(0)
+
+		// Cleanup
+		err = c.Clientset.AppsV1().Deployments(clusterInfo.Namespace).Delete(ctx, "rook-ceph-osd-0", metav1.DeleteOptions{})
+		assert.NoError(t, err)
+	})
+
+	t.Run("OSD without metadata device", func(t *testing.T) {
+		labels := map[string]string{
+			k8sutil.AppAttr:     AppName,
+			k8sutil.ClusterAttr: clusterInfo.Namespace,
+			OsdIdLabelKey:       "1",
+		}
+		deployment := &apps.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-osd-1",
+				Namespace: clusterInfo.Namespace,
+				Labels:    labels,
+			},
+			Spec: apps.DeploymentSpec{
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{
+							{
+								Name: "osd",
+								Env: []corev1.EnvVar{
+									{Name: "ROOK_BLOCK_PATH", Value: "/dev/sdb"},
+									{Name: "ROOK_NODE_NAME", Value: "worker-2"},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		_, err := c.Clientset.AppsV1().Deployments(clusterInfo.Namespace).Create(ctx, deployment, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Should log without panicking even without metadata device
+		osdMon.logOSDDeviceInfo(1)
+
+		// Cleanup
+		err = c.Clientset.AppsV1().Deployments(clusterInfo.Namespace).Delete(ctx, "rook-ceph-osd-1", metav1.DeleteOptions{})
+		assert.NoError(t, err)
+	})
+
+	t.Run("nonexistent OSD deployment", func(t *testing.T) {
+		// Should not panic when deployment doesn't exist
+		osdMon.logOSDDeviceInfo(999)
+	})
 }
 
 func TestMonitorStart(t *testing.T) {

@@ -130,6 +130,9 @@ func (m *OSDHealthMonitor) checkOSDDump() error {
 
 		log.NamespacedDebug(m.clusterInfo.Namespace, logger, "osd.%d is marked 'DOWN'", id)
 
+		// Log detailed device information for the DOWN OSD to help diagnose disk failures
+		m.logOSDDeviceInfo(id)
+
 		if in != inStatus {
 			log.NamespacedDebug(m.clusterInfo.Namespace, logger, "osd.%d is marked 'OUT'", id)
 			if m.removeOSDsIfOUTAndSafeToRemove {
@@ -141,6 +144,46 @@ func (m *OSDHealthMonitor) checkOSDDump() error {
 	}
 
 	return nil
+}
+
+// logOSDDeviceInfo looks up the OSD deployment to log device details for a DOWN OSD.
+// This helps operators diagnose disk failures and understand which devices are affected,
+// especially when a metadata device is shared across multiple OSDs.
+func (m *OSDHealthMonitor) logOSDDeviceInfo(osdID int) {
+	label := fmt.Sprintf("%s=%d", OsdIdLabelKey, osdID)
+	dp, err := k8sutil.GetDeployments(m.clusterInfo.Context, m.context.Clientset, m.clusterInfo.Namespace, label)
+	if err != nil || len(dp.Items) == 0 {
+		return
+	}
+
+	d := &dp.Items[0]
+	var blockPath, metadataDevice, nodeName string
+	for _, c := range d.Spec.Template.Spec.Containers {
+		for _, env := range c.Env {
+			switch env.Name {
+			case blockPathVarName, "ROOK_LV_PATH":
+				blockPath = env.Value
+			case osdMetadataDeviceEnvVarName:
+				metadataDevice = env.Value
+			case "ROOK_NODE_NAME":
+				nodeName = env.Value
+			}
+		}
+	}
+
+	if blockPath == "" {
+		return
+	}
+
+	log.NamespacedWarning(m.clusterInfo.Namespace, logger,
+		"osd.%d is DOWN: data device=%q, metadata device=%q, node=%q. "+
+			"If this is due to a disk failure, the OSD must be purged manually before the device can be reprovisioned. "+
+			"To replace the OSD: (1) ceph osd purge %d --yes-i-really-mean-it, "+
+			"(2) replace or wipe the failed disk, "+
+			"(3) kubectl delete deploy %s -n %s, "+
+			"(4) the operator will reprovision the OSD automatically.",
+		osdID, blockPath, metadataDevice, nodeName,
+		osdID, d.Name, m.clusterInfo.Namespace)
 }
 
 func (m *OSDHealthMonitor) removeOSDDeploymentIfSafeToDestroy(outOSDid int) error {

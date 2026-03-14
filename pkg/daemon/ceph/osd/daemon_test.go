@@ -575,3 +575,174 @@ func TestGetVolumeGroupName(t *testing.T) {
 	vgName = getVolumeGroupName(invalidLVPath2)
 	assert.Equal(t, vgName, "")
 }
+
+func TestIsDeviceExplicitlyRequested(t *testing.T) {
+	desiredDevices := []DesiredDevice{
+		{Name: "sda"},
+		{Name: "/dev/sdb"},
+		{Name: "^sd.*", IsFilter: true},
+		{Name: "^/dev/disk/.*", IsDevicePathFilter: true},
+	}
+
+	// Exact match by short name
+	assert.True(t, isDeviceExplicitlyRequested("sda", desiredDevices))
+
+	// Match with /dev/ prefix normalization
+	assert.True(t, isDeviceExplicitlyRequested("sdb", desiredDevices))
+
+	// No match
+	assert.False(t, isDeviceExplicitlyRequested("sdc", desiredDevices))
+
+	// Filters and path filters are NOT explicit requests
+	assert.False(t, isDeviceExplicitlyRequested("sdx", desiredDevices))
+
+	// Empty desired devices
+	assert.False(t, isDeviceExplicitlyRequested("sda", nil))
+}
+
+func TestEnsureDesiredDevicesInInventory(t *testing.T) {
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if command == "lsblk" {
+				if strings.Contains(args[0], "/dev/nbd0") {
+					return `SIZE="5368709120" ROTA="1" RO="0" TYPE="disk" PKNAME="" NAME="/dev/nbd0" KNAME="/dev/nbd0" MOUNTPOINT="" FSTYPE="LVM2_member"`, nil
+				}
+				if strings.Contains(args[0], "/dev/nbd2") {
+					return `SIZE="21474836480" ROTA="0" RO="0" TYPE="disk" PKNAME="" NAME="/dev/nbd2" KNAME="/dev/nbd2" MOUNTPOINT="" FSTYPE="LVM2_member"`, nil
+				}
+				if strings.Contains(args[0], "/dev/nonexistent") {
+					return "", errors.New("not a block device")
+				}
+			}
+			return "", nil
+		},
+	}
+	context := &clusterd.Context{Executor: executor}
+
+	t.Run("adds missing explicitly requested device", func(t *testing.T) {
+		rawDevices := []*sys.LocalDisk{
+			{Name: "nbd1", RealPath: "/dev/nbd1"},
+		}
+		desiredDevices := []DesiredDevice{
+			{Name: "nbd0"},
+			{Name: "nbd1"},
+		}
+
+		result := ensureDesiredDevicesInInventory(context, desiredDevices, rawDevices)
+		assert.Equal(t, 2, len(result))
+		assert.Equal(t, "nbd0", result[1].Name)
+		assert.Equal(t, "/dev/nbd0", result[1].RealPath)
+		assert.True(t, result[1].HasChildren)
+		assert.Equal(t, "LVM2_member", result[1].Filesystem)
+	})
+
+	t.Run("does not duplicate existing device", func(t *testing.T) {
+		rawDevices := []*sys.LocalDisk{
+			{Name: "nbd0", RealPath: "/dev/nbd0"},
+		}
+		desiredDevices := []DesiredDevice{
+			{Name: "nbd0"},
+		}
+
+		result := ensureDesiredDevicesInInventory(context, desiredDevices, rawDevices)
+		assert.Equal(t, 1, len(result))
+	})
+
+	t.Run("skips filters and useAllDevices", func(t *testing.T) {
+		rawDevices := []*sys.LocalDisk{}
+		desiredDevices := []DesiredDevice{
+			{Name: "all"},
+			{Name: "^nbd.*", IsFilter: true},
+			{Name: "^/dev/disk/.*", IsDevicePathFilter: true},
+		}
+
+		result := ensureDesiredDevicesInInventory(context, desiredDevices, rawDevices)
+		assert.Equal(t, 0, len(result))
+	})
+
+	t.Run("handles /dev/ prefix in desired device name", func(t *testing.T) {
+		rawDevices := []*sys.LocalDisk{}
+		desiredDevices := []DesiredDevice{
+			{Name: "/dev/nbd2"},
+		}
+
+		result := ensureDesiredDevicesInInventory(context, desiredDevices, rawDevices)
+		assert.Equal(t, 1, len(result))
+		assert.Equal(t, "nbd2", result[0].Name)
+		assert.Equal(t, "/dev/nbd2", result[0].RealPath)
+	})
+
+	t.Run("skips device that fails probe", func(t *testing.T) {
+		rawDevices := []*sys.LocalDisk{}
+		desiredDevices := []DesiredDevice{
+			{Name: "nonexistent"},
+		}
+
+		result := ensureDesiredDevicesInInventory(context, desiredDevices, rawDevices)
+		assert.Equal(t, 0, len(result))
+	})
+}
+
+func TestLVM2MemberDeviceHandling(t *testing.T) {
+	getOsdUUID = func(device *sys.LocalDisk) (string, error) {
+		return "", nil
+	}
+	defer func() { getOsdUUID = getOsdUUIDImpl }()
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if command == "lsblk" {
+				return `TYPE="disk"`, nil
+			}
+			if command == "ceph-volume" {
+				return cvInventoryOutputAvailable, nil
+			}
+			return "", nil
+		},
+	}
+
+	context := &clusterd.Context{Executor: executor}
+
+	t.Run("LVM2_member device skipped when not explicitly requested", func(t *testing.T) {
+		context.Devices = []*sys.LocalDisk{
+			{Name: "sda", RealPath: "/dev/sda", Filesystem: "LVM2_member"},
+		}
+		agent := &OsdAgent{
+			devices:     []DesiredDevice{{Name: "all"}},
+			pvcBacked:   false,
+			clusterInfo: &cephclient.ClusterInfo{},
+		}
+		mapping, err := getAvailableDevices(context, agent)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(mapping.Entries))
+	})
+
+	t.Run("LVM2_member device allowed when explicitly requested", func(t *testing.T) {
+		context.Devices = []*sys.LocalDisk{
+			{Name: "nbd0", RealPath: "/dev/nbd0", Filesystem: "LVM2_member"},
+		}
+		agent := &OsdAgent{
+			devices:     []DesiredDevice{{Name: "nbd0"}},
+			pvcBacked:   false,
+			clusterInfo: &cephclient.ClusterInfo{},
+		}
+		mapping, err := getAvailableDevices(context, agent)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(mapping.Entries))
+		assert.Equal(t, -1, mapping.Entries["nbd0"].Data)
+	})
+
+	t.Run("LVM2_member device skipped when only matching filter", func(t *testing.T) {
+		context.Devices = []*sys.LocalDisk{
+			{Name: "nbd0", RealPath: "/dev/nbd0", Filesystem: "LVM2_member"},
+		}
+		agent := &OsdAgent{
+			devices:     []DesiredDevice{{Name: "^nbd.*", IsFilter: true}},
+			pvcBacked:   false,
+			clusterInfo: &cephclient.ClusterInfo{},
+		}
+		mapping, err := getAvailableDevices(context, agent)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, len(mapping.Entries))
+	})
+}

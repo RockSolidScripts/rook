@@ -18,6 +18,8 @@ package osd
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -646,7 +648,23 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 					}
 				}
 				if metadataDevice == nil {
-					return errors.Errorf("metadata device %s is not found", md)
+					// Fallback: metadata device may not be in inventory due to LVM children
+					// from existing OSDs. Probe it directly.
+					probePath := md
+					if !strings.HasPrefix(probePath, "/dev/") {
+						probePath = "/dev/" + md
+					}
+					_, probeErr := sys.GetDevicePropertiesFromPath(probePath, context.Executor)
+					if probeErr != nil {
+						return errors.Errorf("metadata device %s is not found or not available: %v", md, probeErr)
+					}
+					logger.Infof("metadata device %s found via direct probe (not in inventory due to LVM children)", md)
+					metadataDevice = &sys.LocalDisk{
+						Name:        md,
+						RealPath:    probePath,
+						Type:        sys.DiskType,
+						HasChildren: true,
+					}
 				}
 				// lvm device format is /dev/<vg>/<lv>
 				if metadataDevice.Type != sys.LVMType {
@@ -742,6 +760,82 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 		if part, ok := conf["part"]; ok && part == "true" {
 			hasPart = true
 		}
+
+		// Check if the metadata device already has a Ceph VG (OSD replacement scenario).
+		// If so, use ceph-volume lvm prepare mode with a manually-created db LV
+		// instead of batch mode (which fails on devices with existing VGs).
+		if !hasPart {
+			existingVG, vgErr := getExistingCephVG(context.Executor, mdPath)
+			if vgErr != nil {
+				logger.Warningf("failed to check for existing Ceph VG on %s: %v", mdPath, vgErr)
+			}
+			if existingVG != "" {
+				logger.Infof("metadata device %s has existing Ceph VG %s, using prepare mode for OSD replacement", mdPath, existingVG)
+
+				// Clean up orphaned db LVs from purged OSDs to free VG space
+				if err := a.removeOrphanedDBLVs(context, existingVG); err != nil {
+					logger.Warningf("failed to remove orphaned db LVs from VG %s: %v", existingVG, err)
+				}
+
+				// Get db size
+				var dbSizeBytes uint64
+				if dbSizeStr, ok := conf["databasesizemb"]; ok {
+					parsed, parseErr := strconv.ParseUint(dbSizeStr, 10, 64)
+					if parseErr == nil {
+						dbSizeBytes = parsed // already in bytes (display.MbTob was applied earlier)
+					}
+				}
+				if dbSizeBytes == 0 {
+					dbSizeBytes = 3 * 1024 * 1024 * 1024 // default 3GB
+				}
+
+				// Process each data device in this metadata group
+				dataDevices := strings.Split(conf["devices"], " ")
+				for _, dataDevice := range dataDevices {
+					// Clean up stale LVM on the data device (orphaned VG/PV from purged OSD)
+					if err := cleanupStaleDataDeviceLVM(context.Executor, dataDevice); err != nil {
+						logger.Warningf("failed to clean up stale LVM on %s: %v", dataDevice, err)
+					}
+
+					// Create a new db LV in the existing VG
+					dbLVPath, lvErr := createDBLVInExistingVG(context.Executor, existingVG, dbSizeBytes)
+					if lvErr != nil {
+						return errors.Wrapf(lvErr, "failed to create db LV in VG %s for device %s", existingVG, dataDevice)
+					}
+
+					// Build ceph-volume lvm prepare command
+					prepareArgs := []string{"-oL", cephVolumeCmd, "--log-path", logPath, "lvm", "prepare", storeFlag}
+					if a.storeConfig.EncryptedDevice {
+						prepareArgs = append(prepareArgs, encryptedFlag)
+					}
+					prepareArgs = append(prepareArgs, dataFlag, dataDevice, blockDBFlag, dbLVPath)
+
+					// Reuse the destroyed OSD's ID if this is a replace operation
+					if a.replaceOSD != nil {
+						replaceOSDID := a.GetReplaceOSDId(dataDevice)
+						if replaceOSDID != -1 {
+							prepareArgs = append(prepareArgs, "--osd-id", fmt.Sprintf("%d", replaceOSDID))
+						}
+					}
+
+					// Add device class if configured
+					if dc, ok := conf["deviceclass"]; ok {
+						prepareArgs = append(prepareArgs, crushDeviceClassFlag, dc)
+					}
+
+					logger.Infof("running ceph-volume lvm prepare for OSD replacement: data=%s db=%s", dataDevice, dbLVPath)
+					if err := context.Executor.ExecuteCommand(baseCommand, prepareArgs...); err != nil {
+						cvLog := readCVLogContent("/tmp/ceph-log/ceph-volume.log")
+						if cvLog != "" {
+							logger.Errorf("%s", cvLog)
+						}
+						return errors.Wrapf(err, "failed ceph-volume lvm prepare for device %s", dataDevice)
+					}
+				}
+				continue // skip the normal batch execution for this metadata device
+			}
+		}
+
 		if hasPart {
 			// ceph-volume lvm prepare --data {vg/lv} --block.wal {partition} --block.db {/path/to/device}
 			baseArgs := []string{"-oL", cephVolumeCmd, "--log-path", logPath, "lvm", "prepare", storeFlag}
@@ -1435,4 +1529,220 @@ func GetBackingDeviceForEncryptedBlock(context *clusterd.Context, disk string) (
 	}
 
 	return "", errors.Errorf("failed to find backing device for encrypted block %q", disk)
+}
+
+// nsenterLVMCommand executes an LVM command via nsenter in the host's mount namespace.
+// LVM commands inside a container operate on the container's mount namespace, which
+// differs from the host's. ceph-volume uses nsenter for LVM commands, so Rook must too.
+func nsenterLVMCommand(executor interface {
+	ExecuteCommandWithOutput(command string, args ...string) (string, error)
+}, command string, args ...string,
+) (string, error) {
+	nsenterArgs := []string{fmt.Sprintf("--mount=%s", mountNsPath), "--", command}
+	nsenterArgs = append(nsenterArgs, args...)
+	return executor.ExecuteCommandWithOutput(nsenterCmd, nsenterArgs...)
+}
+
+// getExistingCephVG checks if a device is a PV in an existing Ceph VG.
+// Returns the VG name if found (starts with "ceph-"), empty string otherwise.
+func getExistingCephVG(executor interface {
+	ExecuteCommandWithOutput(command string, args ...string) (string, error)
+}, devicePath string,
+) (string, error) {
+	output, err := nsenterLVMCommand(executor, "pvs",
+		"--select", fmt.Sprintf("pv_name=%s", devicePath),
+		"-o", "vg_name",
+		"--noheadings",
+		"--nosuffix",
+	)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to query PVS for %s", devicePath)
+	}
+
+	vgName := strings.TrimSpace(output)
+	if vgName == "" || !strings.HasPrefix(vgName, "ceph-") {
+		return "", nil
+	}
+	return vgName, nil
+}
+
+// removeOrphanedDBLVs removes db LVs in a VG that belong to OSDs no longer active in the cluster.
+// This frees space for creating new db LVs during OSD replacement.
+func (a *OsdAgent) removeOrphanedDBLVs(context *clusterd.Context, vgName string) error {
+	// Get list of active OSD IDs from the cluster
+	activeOSDs, err := client.OsdListNum(context, a.clusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to list active OSDs")
+	}
+	activeSet := make(map[int]bool, len(activeOSDs))
+	for _, id := range activeOSDs {
+		activeSet[id] = true
+	}
+
+	// List all LVs in the VG with their tags
+	output, err := nsenterLVMCommand(context.Executor, "lvs",
+		"--select", fmt.Sprintf("vg_name=%s", vgName),
+		"-o", "lv_name,lv_tags",
+		"--noheadings",
+		"--nosuffix",
+		"--separator", "|",
+	)
+	if err != nil {
+		return errors.Wrapf(err, "failed to list LVs in VG %s", vgName)
+	}
+
+	for line := range strings.SplitSeq(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) < 2 {
+			continue
+		}
+
+		lvName := strings.TrimSpace(parts[0])
+		tags := strings.TrimSpace(parts[1])
+
+		// Only process db LVs (check for osd-db prefix or ceph.type=db tag)
+		isDBLV := strings.HasPrefix(lvName, "osd-db-")
+		for _, tag := range strings.Split(tags, ",") {
+			if tag == "ceph.type=db" {
+				isDBLV = true
+				break
+			}
+		}
+		if !isDBLV {
+			continue
+		}
+
+		// Check if the OSD ID in the tags is still active
+		isOrphan := false
+		if tags == "" {
+			// No tags at all — orphaned from a failed prior run
+			isOrphan = true
+		} else {
+			for _, tag := range strings.Split(tags, ",") {
+				if strings.HasPrefix(tag, "ceph.osd_id=") {
+					osdIDStr := strings.TrimPrefix(tag, "ceph.osd_id=")
+					osdID, parseErr := strconv.Atoi(osdIDStr)
+					if parseErr == nil && !activeSet[osdID] {
+						isOrphan = true
+					}
+					break
+				}
+			}
+		}
+
+		if !isOrphan {
+			continue
+		}
+
+		lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
+		logger.Infof("removing orphaned db LV %s", lvPath)
+
+		// Close dm-crypt layer if present (encrypted clusters)
+		for _, tag := range strings.Split(tags, ",") {
+			if strings.HasPrefix(tag, "ceph.db_uuid=") {
+				dbUUID := strings.TrimPrefix(tag, "ceph.db_uuid=")
+				if dbUUID != "" {
+					logger.Infof("closing dm-crypt device %s on orphaned db LV", dbUUID)
+					_, _ = nsenterLVMCommand(context.Executor, "dmsetup", "remove", "--force", dbUUID)
+				}
+				break
+			}
+		}
+
+		// Deactivate and remove the orphaned LV
+		if _, err := nsenterLVMCommand(context.Executor, "lvchange", "-an", lvPath); err != nil {
+			logger.Warningf("failed to deactivate orphaned LV %s: %v", lvPath, err)
+		}
+		if _, err := nsenterLVMCommand(context.Executor, "lvremove", "-f", lvPath); err != nil {
+			logger.Warningf("failed to remove orphaned LV %s: %v", lvPath, err)
+		} else {
+			logger.Infof("successfully removed orphaned db LV %s", lvPath)
+		}
+	}
+
+	return nil
+}
+
+// cleanupStaleDataDeviceLVM removes stale VG and PV on a data device before reuse.
+// This handles the case where a data device still has LVM structures from a previously purged OSD.
+func cleanupStaleDataDeviceLVM(executor interface {
+	ExecuteCommandWithOutput(command string, args ...string) (string, error)
+}, devicePath string,
+) error {
+	// Check if the device has a VG
+	vgName, err := getExistingCephVG(executor, devicePath)
+	if err != nil || vgName == "" {
+		return nil // no stale LVM to clean up
+	}
+
+	logger.Infof("cleaning up stale LVM on data device %s (VG: %s)", devicePath, vgName)
+
+	// Remove the VG (which also removes its LVs)
+	if _, err := nsenterLVMCommand(executor, "vgremove", "-f", vgName); err != nil {
+		logger.Warningf("failed to remove stale VG %s on %s: %v", vgName, devicePath, err)
+	}
+
+	// Remove the PV
+	if _, err := nsenterLVMCommand(executor, "pvremove", "-f", devicePath); err != nil {
+		logger.Warningf("failed to remove stale PV on %s: %v", devicePath, err)
+	}
+
+	return nil
+}
+
+// createDBLVInExistingVG creates a new db LV in an existing Ceph VG for OSD replacement.
+// It adds the ceph.type=db tag and creates device nodes via vgmknodes.
+func createDBLVInExistingVG(executor interface {
+	ExecuteCommandWithOutput(command string, args ...string) (string, error)
+}, vgName string, dbSizeBytes uint64,
+) (string, error) {
+	lvName := fmt.Sprintf("osd-db-%s", newUUID())
+
+	_, err := nsenterLVMCommand(executor, "lvcreate",
+		"-L", fmt.Sprintf("%dB", dbSizeBytes),
+		"-n", lvName,
+		vgName,
+	)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to create db LV %s in VG %s", lvName, vgName)
+	}
+
+	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
+
+	// Tag the LV so ceph-volume recognizes it
+	if _, err := nsenterLVMCommand(executor, "lvchange", "--addtag", "ceph.type=db", lvPath); err != nil {
+		return "", errors.Wrapf(err, "failed to add ceph.type=db tag to %s", lvPath)
+	}
+
+	// Create real device nodes (not symlinks) so ceph-volume's os.path.realpath()
+	// doesn't resolve to /dev/mapper and break the lvs lv_path lookup
+	if _, err := nsenterLVMCommand(executor, "vgmknodes", vgName); err != nil {
+		logger.Warningf("failed to run vgmknodes for VG %s: %v", vgName, err)
+	}
+
+	logger.Infof("created db LV %s for OSD replacement", lvPath)
+	return lvPath, nil
+}
+
+// newUUID generates a new UUID string for LV naming.
+// This is a variable so it can be overridden in tests.
+var newUUID = generateUUID
+
+func generateUUID() string {
+	b := make([]byte, 16)
+	_, _ = cryptorand.Read(b)
+	// Format as UUID v4
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%s-%s-%s-%s-%s",
+		hex.EncodeToString(b[0:4]),
+		hex.EncodeToString(b[4:6]),
+		hex.EncodeToString(b[6:8]),
+		hex.EncodeToString(b[8:10]),
+		hex.EncodeToString(b[10:16]))
 }

@@ -1942,6 +1942,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle nsenter pvs calls from getExistingCephVG (no existing VG)
+			if command == "nsenter" && len(args) >= 3 && args[2] == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/sdd" && args[14] == "--report" {
 				return `[{"block_db": "/dev/sdd", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "100.00 GB"}]`, nil
@@ -1995,6 +1999,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle nsenter pvs calls from getExistingCephVG (no existing VG)
+			if command == "nsenter" && len(args) >= 3 && args[2] == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/vg0/lv0" && args[14] == "--report" {
 				return `[{"block_db": "vg0/lv0", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "10.00 GB"}]`, nil
@@ -2046,6 +2054,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle nsenter pvs calls from getExistingCephVG (no existing VG)
+			if command == "nsenter" && len(args) >= 3 && args[2] == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/mapper/mpatha" && args[12] == "--db-devices" && args[13] == "/dev/sdd" && args[14] == "--report" {
 				return `[{"block_db": "/dev/sdd", "encryption": "None", "data": "/dev/mapper/mpatha", "data_size": "100.00 GB", "block_db_size": "10.00 GB"}]`, nil
@@ -2326,4 +2338,454 @@ func TestWipeDevicesFromOtherClusters(t *testing.T) {
 	context.Executor = executor
 	err = agent.WipeDevicesFromOtherClusters(context)
 	assert.NoError(t, err)
+}
+
+func TestNsenterLVMCommand(t *testing.T) {
+	var capturedCommand string
+	var capturedArgs []string
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			capturedCommand = command
+			capturedArgs = args
+			return "test-output", nil
+		},
+	}
+
+	output, err := nsenterLVMCommand(executor, "pvs", "--noheadings", "/dev/sda")
+	assert.NoError(t, err)
+	assert.Equal(t, "test-output", output)
+	assert.Equal(t, "nsenter", capturedCommand)
+	assert.Equal(t, "--mount=/rootfs/proc/1/ns/mnt", capturedArgs[0])
+	assert.Equal(t, "--", capturedArgs[1])
+	assert.Equal(t, "pvs", capturedArgs[2])
+	assert.Equal(t, "--noheadings", capturedArgs[3])
+	assert.Equal(t, "/dev/sda", capturedArgs[4])
+}
+
+func TestGetExistingCephVG(t *testing.T) {
+	t.Run("returns ceph VG name", func(t *testing.T) {
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "nsenter" {
+					return "  ceph-f731273a-1234-5678-abcd-ef0123456789  ", nil
+				}
+				return "", nil
+			},
+		}
+		vg, err := getExistingCephVG(executor, "/dev/nbd2")
+		assert.NoError(t, err)
+		assert.Equal(t, "ceph-f731273a-1234-5678-abcd-ef0123456789", vg)
+	})
+
+	t.Run("returns empty for non-ceph VG", func(t *testing.T) {
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				return "  my-vg  ", nil
+			},
+		}
+		vg, err := getExistingCephVG(executor, "/dev/sda")
+		assert.NoError(t, err)
+		assert.Equal(t, "", vg)
+	})
+
+	t.Run("returns empty for no PV", func(t *testing.T) {
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				return "  ", nil
+			},
+		}
+		vg, err := getExistingCephVG(executor, "/dev/sda")
+		assert.NoError(t, err)
+		assert.Equal(t, "", vg)
+	})
+}
+
+func TestRemoveOrphanedDBLVs(t *testing.T) {
+	t.Run("removes orphaned db LV", func(t *testing.T) {
+		var removedLVs []string
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "ceph" {
+					// OsdListNum returns active OSDs [1, 2]
+					return "[1, 2]", nil
+				}
+				if command == "nsenter" {
+					cmdInNs := args[2]
+					if cmdInNs == "lvs" {
+						return `  osd-db-aaa|ceph.osd_id=0,ceph.type=db
+  osd-db-bbb|ceph.osd_id=1,ceph.type=db
+  osd-block-ccc|ceph.osd_id=1,ceph.type=block`, nil
+					}
+					if cmdInNs == "lvchange" {
+						return "", nil
+					}
+					if cmdInNs == "lvremove" {
+						removedLVs = append(removedLVs, args[len(args)-1])
+						return "", nil
+					}
+				}
+				return "", nil
+			},
+		}
+
+		clusterInfo := cephclient.AdminTestClusterInfo("test")
+		agent := &OsdAgent{clusterInfo: clusterInfo}
+		ctx := &clusterd.Context{Executor: executor}
+		err := agent.removeOrphanedDBLVs(ctx, "ceph-vg-test")
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(removedLVs))
+		assert.Equal(t, "/dev/ceph-vg-test/osd-db-aaa", removedLVs[0])
+	})
+
+	t.Run("removes tagless orphan db LV", func(t *testing.T) {
+		var removedLVs []string
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "ceph" {
+					return "[1]", nil
+				}
+				if command == "nsenter" {
+					cmdInNs := args[2]
+					if cmdInNs == "lvs" {
+						return "  osd-db-orphan|", nil
+					}
+					if cmdInNs == "lvchange" || cmdInNs == "lvremove" {
+						if cmdInNs == "lvremove" {
+							removedLVs = append(removedLVs, args[len(args)-1])
+						}
+						return "", nil
+					}
+				}
+				return "", nil
+			},
+		}
+
+		clusterInfo := cephclient.AdminTestClusterInfo("test")
+		agent := &OsdAgent{clusterInfo: clusterInfo}
+		ctx := &clusterd.Context{Executor: executor}
+		err := agent.removeOrphanedDBLVs(ctx, "ceph-vg")
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(removedLVs))
+	})
+
+	t.Run("handles dm-crypt cleanup", func(t *testing.T) {
+		var dmsetupCalled bool
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "ceph" {
+					return "[]", nil
+				}
+				if command == "nsenter" {
+					cmdInNs := args[2]
+					if cmdInNs == "lvs" {
+						return "  osd-db-enc|ceph.osd_id=5,ceph.type=db,ceph.db_uuid=crypt-device-123", nil
+					}
+					if cmdInNs == "dmsetup" {
+						dmsetupCalled = true
+						return "", nil
+					}
+					if cmdInNs == "lvchange" || cmdInNs == "lvremove" {
+						return "", nil
+					}
+				}
+				return "", nil
+			},
+		}
+
+		clusterInfo := cephclient.AdminTestClusterInfo("test")
+		agent := &OsdAgent{clusterInfo: clusterInfo}
+		ctx := &clusterd.Context{Executor: executor}
+		err := agent.removeOrphanedDBLVs(ctx, "ceph-vg")
+		assert.NoError(t, err)
+		assert.True(t, dmsetupCalled)
+	})
+}
+
+func TestCleanupStaleDataDeviceLVM(t *testing.T) {
+	t.Run("cleans up stale VG and PV", func(t *testing.T) {
+		var vgRemoved, pvRemoved bool
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "nsenter" {
+					cmdInNs := args[2]
+					if cmdInNs == "pvs" {
+						return "  ceph-old-vg  ", nil
+					}
+					if cmdInNs == "vgremove" {
+						vgRemoved = true
+						return "", nil
+					}
+					if cmdInNs == "pvremove" {
+						pvRemoved = true
+						return "", nil
+					}
+				}
+				return "", nil
+			},
+		}
+
+		err := cleanupStaleDataDeviceLVM(executor, "/dev/nbd0")
+		assert.NoError(t, err)
+		assert.True(t, vgRemoved)
+		assert.True(t, pvRemoved)
+	})
+
+	t.Run("no-op when device has no VG", func(t *testing.T) {
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "nsenter" {
+					return "  ", nil // no VG
+				}
+				return "", nil
+			},
+		}
+
+		err := cleanupStaleDataDeviceLVM(executor, "/dev/nbd0")
+		assert.NoError(t, err)
+	})
+}
+
+func TestCreateDBLVInExistingVG(t *testing.T) {
+	origNewUUID := newUUID
+	defer func() { newUUID = origNewUUID }()
+	newUUID = func() string { return "test-uuid-1234" }
+
+	t.Run("creates db LV with tags and vgmknodes", func(t *testing.T) {
+		var lvcreated, tagged, vgmknoded bool
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "nsenter" {
+					cmdInNs := args[2]
+					if cmdInNs == "lvcreate" {
+						lvcreated = true
+						// Verify size and name args
+						assert.Contains(t, args, "3221225472B")
+						assert.Contains(t, args, "osd-db-test-uuid-1234")
+						return "", nil
+					}
+					if cmdInNs == "lvchange" {
+						tagged = true
+						assert.Contains(t, args, "ceph.type=db")
+						return "", nil
+					}
+					if cmdInNs == "vgmknodes" {
+						vgmknoded = true
+						return "", nil
+					}
+				}
+				return "", nil
+			},
+		}
+
+		dbSize := uint64(3 * 1024 * 1024 * 1024) // 3GB
+		lvPath, err := createDBLVInExistingVG(executor, "ceph-test-vg", dbSize)
+		assert.NoError(t, err)
+		assert.Equal(t, "/dev/ceph-test-vg/osd-db-test-uuid-1234", lvPath)
+		assert.True(t, lvcreated)
+		assert.True(t, tagged)
+		assert.True(t, vgmknoded)
+	})
+
+	t.Run("returns error on lvcreate failure", func(t *testing.T) {
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command == "nsenter" && args[2] == "lvcreate" {
+					return "", errors.New("insufficient space")
+				}
+				return "", nil
+			},
+		}
+
+		_, err := createDBLVInExistingVG(executor, "ceph-vg", 1024)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "insufficient space")
+	})
+}
+
+func TestInitializeBlockWithMDExistingVG(t *testing.T) {
+	// Override UUID generator for deterministic LV names
+	origUUID := newUUID
+	newUUID = func() string { return "test-uuid-1234" }
+	defer func() { newUUID = origUUID }()
+
+	// Test: metadata device has existing Ceph VG → uses prepare mode instead of batch
+	t.Run("prepare mode with existing VG", func(t *testing.T) {
+		devices := &DeviceOsdMapping{
+			Entries: map[string]*DeviceOsdIDEntry{
+				"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "/dev/sdd"}, DeviceInfo: &sys.LocalDisk{Type: sys.DiskType}},
+			},
+		}
+
+		var prepareExecuted bool
+		executor := &exectest.MockExecutor{}
+		executor.MockExecuteCommand = func(command string, args ...string) error {
+			logger.Infof("%s %v", command, args)
+			// Expect ceph-volume lvm prepare (NOT batch)
+			if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "prepare" && args[6] == "--bluestore" &&
+				args[7] == "--data" && args[8] == "/dev/sda" &&
+				args[9] == "--block.db" && args[10] == "/dev/ceph-abc123/osd-db-test-uuid-1234" {
+				prepareExecuted = true
+				return nil
+			}
+			return errors.Errorf("unknown command %s %v", command, args)
+		}
+		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			if command == "nsenter" && len(args) >= 3 {
+				lvmCmd := args[2]
+				switch lvmCmd {
+				case "pvs":
+					// getExistingCephVG: return existing ceph VG for metadata device
+					for _, a := range args {
+						if a == "pv_name=/dev/sdd" {
+							return "  ceph-abc123", nil
+						}
+					}
+					return "", nil
+				case "lvs":
+					// removeOrphanedDBLVs: no existing LVs
+					return "", nil
+				case "lvcreate":
+					return "", nil
+				case "lvchange":
+					return "", nil
+				case "vgmknodes":
+					return "", nil
+				}
+			}
+			return "", errors.Errorf("unknown command %s %v", command, args)
+		}
+
+		a := &OsdAgent{
+			clusterInfo: &cephclient.ClusterInfo{
+				CephVersion: cephver.CephVersion{Major: 17, Minor: 2, Extra: 4},
+				Context:     context.TODO(),
+			},
+			nodeName:    "node1",
+			storeConfig: config.StoreConfig{StoreType: "bluestore"},
+		}
+		ctx := &clusterd.Context{
+			Executor: executor,
+			Devices: []*sys.LocalDisk{
+				{Name: "sda", Type: "disk"},
+				{Name: "sdd", Type: "disk"},
+			},
+		}
+
+		err := a.initializeDevicesLVMMode(ctx, devices)
+		assert.NoError(t, err)
+		assert.True(t, prepareExecuted, "expected ceph-volume lvm prepare to be called")
+	})
+
+	// Test: replaceOSD set → --osd-id is passed in prepare command
+	t.Run("prepare mode with replaceOSD passes osd-id", func(t *testing.T) {
+		devices := &DeviceOsdMapping{
+			Entries: map[string]*DeviceOsdIDEntry{
+				"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "/dev/sdd"}, DeviceInfo: &sys.LocalDisk{Type: sys.DiskType}},
+			},
+		}
+
+		var osdIDPassed bool
+		executor := &exectest.MockExecutor{}
+		executor.MockExecuteCommand = func(command string, args ...string) error {
+			logger.Infof("%s %v", command, args)
+			if args[1] == "ceph-volume" && args[4] == "lvm" && args[5] == "prepare" && args[6] == "--bluestore" &&
+				args[7] == "--data" && args[8] == "/dev/sda" &&
+				args[9] == "--block.db" && args[10] == "/dev/ceph-abc123/osd-db-test-uuid-1234" &&
+				args[11] == "--osd-id" && args[12] == "5" {
+				osdIDPassed = true
+				return nil
+			}
+			return errors.Errorf("unknown command %s %v", command, args)
+		}
+		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			if command == "nsenter" && len(args) >= 3 {
+				switch args[2] {
+				case "pvs":
+					return "  ceph-abc123", nil
+				case "lvs":
+					return "", nil
+				case "lvcreate":
+					return "", nil
+				case "lvchange":
+					return "", nil
+				case "vgmknodes":
+					return "", nil
+				}
+			}
+			return "", errors.Errorf("unknown command %s %v", command, args)
+		}
+
+		a := &OsdAgent{
+			clusterInfo: &cephclient.ClusterInfo{
+				CephVersion: cephver.CephVersion{Major: 17, Minor: 2, Extra: 4},
+				Context:     context.TODO(),
+			},
+			nodeName:    "node1",
+			storeConfig: config.StoreConfig{StoreType: "bluestore"},
+			replaceOSD:  &oposd.OSDInfo{ID: 5, BlockPath: "/dev/sda"},
+		}
+		ctx := &clusterd.Context{
+			Executor: executor,
+			Devices: []*sys.LocalDisk{
+				{Name: "sda", Type: "disk"},
+				{Name: "sdd", Type: "disk"},
+			},
+		}
+
+		err := a.initializeDevicesLVMMode(ctx, devices)
+		assert.NoError(t, err)
+		assert.True(t, osdIDPassed, "expected --osd-id 5 to be passed in ceph-volume lvm prepare")
+	})
+
+	// Test: no existing VG on metadata device → falls through to normal batch mode
+	t.Run("no existing VG uses batch mode", func(t *testing.T) {
+		devices := &DeviceOsdMapping{
+			Entries: map[string]*DeviceOsdIDEntry{
+				"sda": {Data: -1, Metadata: nil, Config: DesiredDevice{Name: "/dev/sda", MetadataDevice: "/dev/sdd"}, DeviceInfo: &sys.LocalDisk{Type: sys.DiskType}},
+			},
+		}
+
+		var batchExecuted bool
+		executor := &exectest.MockExecutor{}
+		executor.MockExecuteCommand = func(command string, args ...string) error {
+			logger.Infof("%s %v", command, args)
+			err := testBaseArgs(args)
+			if err != nil {
+				return err
+			}
+			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" {
+				batchExecuted = true
+				return nil
+			}
+			return errors.Errorf("unknown command %s %v", command, args)
+		}
+		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// nsenter pvs → no existing VG
+			if command == "nsenter" && len(args) >= 3 && args[2] == "pvs" {
+				return "", nil
+			}
+			// batch report
+			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/sdd" && args[14] == "--report" {
+				return `[{"block_db": "/dev/sdd", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "100.00 GB"}]`, nil
+			}
+			return "", errors.Errorf("unknown command %s %v", command, args)
+		}
+
+		a := &OsdAgent{
+			clusterInfo: &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 2, Extra: 4}},
+			nodeName:    "node1",
+			storeConfig: config.StoreConfig{StoreType: "bluestore"},
+		}
+		ctx := &clusterd.Context{
+			Executor: executor,
+			Devices: []*sys.LocalDisk{
+				{Name: "sda", Type: "disk"},
+				{Name: "sdd", Type: "disk"},
+			},
+		}
+
+		err := a.initializeDevicesLVMMode(ctx, devices)
+		assert.NoError(t, err)
+		assert.True(t, batchExecuted, "expected batch mode to be used when no existing VG")
+	})
 }
