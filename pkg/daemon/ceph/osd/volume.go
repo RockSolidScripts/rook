@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
@@ -767,52 +766,13 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 				logger.Warningf("failed to check for existing Ceph VG on %s: %v", mdPath, err)
 			}
 			if vgName != "" {
-				logger.Infof("metadata device %s already has Ceph VG %s, will use prepare mode", mdPath, vgName)
+				logger.Infof("metadata device %s already has Ceph VG %s, will pass all devices to ceph-volume batch", mdPath, vgName)
 				hasExistingLVM = true
-			}
-		}
-		if hasExistingLVM {
-			// The metadata device already has a Ceph VG from existing OSDs.
-			// We cannot use batch mode; instead create a new db LV in the existing VG
-			// and use ceph-volume lvm prepare.
-			vgName, _ := getExistingCephVG(context.Executor, mdPath)
-			devices := strings.Split(conf["devices"], " ")
-			for _, dev := range devices {
-				// Determine db size
-				var dbSizeBytes uint64 = 3 * 1024 * 1024 * 1024 // Default 3GB
-				if dbSizeStr, ok := conf["databasesizemb"]; ok {
-					parsed, parseErr := strconv.ParseUint(dbSizeStr, 10, 64)
-					if parseErr == nil {
-						dbSizeBytes = parsed // databasesizemb is already in bytes (converted by display.MbTob)
-					}
-				}
-
-				osdUUID := uuid.New().String()
-				dbLVPath, err := createDBLVInExistingVG(context.Executor, vgName, dbSizeBytes, osdUUID)
-				if err != nil {
-					return errors.Wrapf(err, "failed to create db LV for device %s", dev)
-				}
-
-				prepArgs := []string{"-oL", cephVolumeCmd, "--log-path", logPath, "lvm", "prepare", storeFlag}
-				if a.storeConfig.EncryptedDevice {
-					prepArgs = append(prepArgs, encryptedFlag)
-				}
-				prepArgs = append(prepArgs, dataFlag, dev, blockDBFlag, dbLVPath)
-
-				if _, ok := conf["deviceclass"]; ok {
-					prepArgs = append(prepArgs, crushDeviceClassFlag, conf["deviceclass"])
-				}
-
-				logger.Infof("preparing OSD on %s with db LV %s (existing VG %s)", dev, dbLVPath, vgName)
-				if err := context.Executor.ExecuteCommand(baseCommand, prepArgs...); err != nil {
-					cvLog := readCVLogContent("/tmp/ceph-log/ceph-volume.log")
-					if cvLog != "" {
-						logger.Errorf("%s", cvLog)
-					}
-					return errors.Wrapf(err, "failed ceph-volume prepare for device %s", dev)
+				// Clean up orphaned db LVs from purged OSDs to free space in the VG
+				if err := a.removeOrphanedDBLVs(context, vgName); err != nil {
+					logger.Warningf("failed to clean up orphaned db LVs in VG %s: %v", vgName, err)
 				}
 			}
-			continue
 		}
 		if hasPart {
 			// ceph-volume lvm prepare --data {vg/lv} --block.wal {partition} --block.db {/path/to/device}
@@ -871,7 +831,7 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 			}...)
 		}
 
-		if !hasPart {
+		if !hasPart && !hasExistingLVM {
 			// Reporting
 			reportArgs := append(mdArgs, []string{
 				"--report",
@@ -907,6 +867,8 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 					return errors.Errorf("wrong db device for %s, required: %s, actual: %s", report.Data, mdPath, report.BlockDB)
 				}
 			}
+		} else if hasExistingLVM {
+			logger.Infof("skipping ceph-volume report validation (metadata device %s has existing OSDs)", mdPath)
 		}
 
 		// execute ceph-volume batching up multiple devices
@@ -936,22 +898,81 @@ func getExistingCephVG(executor exec.Executor, devicePath string) (string, error
 	return vgName, nil
 }
 
-// createDBLVInExistingVG creates a new db LV in an existing Ceph VG.
-func createDBLVInExistingVG(executor exec.Executor, vgName string, dbSizeBytes uint64, osdUUID string) (string, error) {
-	lvName := fmt.Sprintf("osd-db-%s", osdUUID)
+// removeOrphanedDBLVs finds db LVs in the VG that belong to purged OSDs and removes them
+// to free space for new OSD provisioning.
+func (a *OsdAgent) removeOrphanedDBLVs(context *clusterd.Context, vgName string) error {
+	// Get list of active OSD IDs from the Ceph cluster
+	activeOSDs, err := client.OsdListNum(context, a.clusterInfo)
+	if err != nil {
+		return errors.Wrap(err, "failed to get active OSD list")
+	}
+	activeSet := make(map[int]bool)
+	for _, id := range activeOSDs {
+		activeSet[id] = true
+	}
+	logger.Infof("active OSDs in cluster: %v", activeOSDs)
 
-	_, err := executor.ExecuteCommandWithOutput("lvcreate",
-		"-L", fmt.Sprintf("%dB", dbSizeBytes),
-		"-n", lvName,
-		vgName,
+	// List all LVs in the VG with their tags to find orphaned db LVs
+	output, err := context.Executor.ExecuteCommandWithOutput("lvs",
+		"--noheadings",
+		"--separator", "|",
+		"-o", "lv_name,lv_path,lv_tags",
+		"--select", fmt.Sprintf("vg_name=%s", vgName),
 	)
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to create db LV %s in VG %s", lvName, vgName)
+		return errors.Wrap(err, "failed to list LVs in VG")
 	}
 
-	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
-	logger.Infof("created db LV %s for OSD replacement", lvPath)
-	return lvPath, nil
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		lvName := strings.TrimSpace(parts[0])
+		lvPath := strings.TrimSpace(parts[1])
+		tags := strings.TrimSpace(parts[2])
+
+		// Only consider db LVs
+		if !strings.HasPrefix(lvName, "osd-db-") {
+			continue
+		}
+
+		// Extract OSD ID from Ceph LVM tags
+		osdID := -1
+		for _, tag := range strings.Split(tags, ",") {
+			if strings.HasPrefix(tag, "ceph.osd_id=") {
+				idStr := strings.TrimPrefix(tag, "ceph.osd_id=")
+				osdID, _ = strconv.Atoi(idStr)
+				break
+			}
+		}
+
+		if osdID < 0 {
+			continue
+		}
+
+		if !activeSet[osdID] {
+			logger.Infof("found orphaned db LV %s (OSD %d no longer active), removing it", lvPath, osdID)
+
+			// Deactivate the LV first
+			if _, err := context.Executor.ExecuteCommandWithOutput("lvchange", "-an", lvPath); err != nil {
+				logger.Warningf("failed to deactivate orphaned LV %s: %v", lvPath, err)
+			}
+
+			// Remove the orphaned LV to free space
+			if _, err := context.Executor.ExecuteCommandWithOutput("lvremove", "-f", lvPath); err != nil {
+				logger.Warningf("failed to remove orphaned LV %s: %v", lvPath, err)
+			} else {
+				logger.Infof("successfully removed orphaned db LV %s", lvPath)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (a *OsdAgent) appendDeviceClassArg(device *DeviceOsdIDEntry, args []string) []string {
