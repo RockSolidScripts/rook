@@ -1942,6 +1942,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle pvs calls from getExistingCephVG
+			if command == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/sdd" && args[14] == "--report" {
 				return `[{"block_db": "/dev/sdd", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "100.00 GB"}]`, nil
@@ -1995,6 +1999,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle pvs calls from getExistingCephVG
+			if command == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/sda" && args[12] == "--db-devices" && args[13] == "/dev/vg0/lv0" && args[14] == "--report" {
 				return `[{"block_db": "vg0/lv0", "encryption": "None", "data": "/dev/sda", "data_size": "100.00 GB", "block_db_size": "10.00 GB"}]`, nil
@@ -2046,6 +2054,10 @@ func TestInitializeBlockWithMD(t *testing.T) {
 			return errors.Errorf("unknown command %s %s", command, args)
 		}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+			// Handle pvs calls from getExistingCephVG
+			if command == "pvs" {
+				return "", nil
+			}
 			// First command
 			if args[9] == "--osds-per-device" && args[10] == "1" && args[11] == "/dev/mapper/mpatha" && args[12] == "--db-devices" && args[13] == "/dev/sdd" && args[14] == "--report" {
 				return `[{"block_db": "/dev/sdd", "encryption": "None", "data": "/dev/mapper/mpatha", "data_size": "100.00 GB", "block_db_size": "10.00 GB"}]`, nil

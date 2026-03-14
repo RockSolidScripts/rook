@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -197,6 +198,8 @@ func Provision(context *clusterd.Context, agent *OsdAgent, crushLocation, topolo
 		if err != nil {
 			return errors.Wrap(err, "failed initial hardware discovery")
 		}
+		// Add back explicitly requested devices that were skipped due to LVM children
+		rawDevices = ensureDesiredDevicesInInventory(context, agent.devices, rawDevices)
 	}
 
 	context.Devices = rawDevices
@@ -374,6 +377,10 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 
 			} else if device.Filesystem == "mpath_member" && agent.pvcBacked {
 				logger.Infof("allowing multipath disk %q with filesystem %q", device.Name, device.Filesystem)
+			} else if device.Filesystem == "LVM2_member" && isDeviceExplicitlyRequested(device.Name, desiredDevices) {
+				// Device is an LVM PV but explicitly requested. This happens when a device
+				// has existing Ceph LVM structures (e.g., OSD replacement scenario).
+				logger.Infof("allowing LVM device %q because it is explicitly requested", device.Name)
 			} else {
 				logger.Infof("skipping device %q because it contains a filesystem %q", device.Name, device.Filesystem)
 				continue
@@ -595,6 +602,67 @@ func getVolumeGroupName(lvPath string) string {
 	}
 
 	return vgSlice[2]
+}
+
+// ensureDesiredDevicesInInventory adds explicitly requested devices back to
+// the inventory if they were skipped due to having LVM children.
+func ensureDesiredDevicesInInventory(context *clusterd.Context, desiredDevices []DesiredDevice, rawDevices []*sys.LocalDisk) []*sys.LocalDisk {
+	inventoryDevices := make(map[string]bool)
+	for _, d := range rawDevices {
+		inventoryDevices[d.Name] = true
+	}
+
+	for _, desired := range desiredDevices {
+		deviceName := strings.TrimPrefix(desired.Name, "/dev/")
+		if inventoryDevices[deviceName] {
+			continue
+		}
+
+		devicePath := desired.Name
+		if !strings.HasPrefix(devicePath, "/dev/") {
+			devicePath = "/dev/" + devicePath
+		}
+
+		// Probe device directly since it might have been skipped due to LVM children
+		props, err := sys.GetDevicePropertiesFromPath(devicePath, context.Executor)
+		if err != nil {
+			logger.Warningf("failed to probe device %s: %v", devicePath, err)
+			continue
+		}
+
+		var size uint64
+		if sizeStr, ok := props["SIZE"]; ok {
+			size, _ = strconv.ParseUint(sizeStr, 10, 64)
+		}
+
+		fstype := props["FSTYPE"]
+
+		disk := &sys.LocalDisk{
+			Name:        deviceName,
+			RealPath:    devicePath,
+			Type:        sys.DiskType,
+			HasChildren: true,
+			Size:        size,
+			Filesystem:  fstype,
+		}
+
+		logger.Infof("adding device %q to inventory (was skipped due to LVM children)", deviceName)
+		rawDevices = append(rawDevices, disk)
+		inventoryDevices[deviceName] = true
+	}
+
+	return rawDevices
+}
+
+// isDeviceExplicitlyRequested checks if a device is explicitly listed in the desired devices.
+func isDeviceExplicitlyRequested(deviceName string, desiredDevices []DesiredDevice) bool {
+	for _, desired := range desiredDevices {
+		name := strings.TrimPrefix(desired.Name, "/dev/")
+		if name == deviceName || desired.Name == deviceName {
+			return true
+		}
+	}
+	return false
 }
 
 // GetOSDInfoById returns the osdInfo using the ceph volume list
