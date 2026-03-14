@@ -794,6 +794,14 @@ func (a *OsdAgent) initializeDevicesLVMMode(context *clusterd.Context, devices *
 				}
 
 				osdUUID := uuid.New().String()
+
+				// Clean up stale LVM on the data device if it has leftover
+				// structures from a purged OSD (e.g., old VG/LV from the
+				// previous OSD that was removed but not fully zapped).
+				if err := cleanupStaleDataDeviceLVM(context.Executor, dev); err != nil {
+					return errors.Wrapf(err, "failed to clean up stale LVM on data device %s", dev)
+				}
+
 				dbLVPath, err := createDBLVInExistingVG(context.Executor, vgName, dbSizeBytes, osdUUID)
 				if err != nil {
 					return errors.Wrapf(err, "failed to create db LV for device %s", dev)
@@ -1040,6 +1048,57 @@ func (a *OsdAgent) removeOrphanedDBLVs(context *clusterd.Context, vgName string)
 				logger.Infof("successfully removed orphaned db LV %s", lvPath)
 			}
 		}
+	}
+
+	return nil
+}
+
+// cleanupStaleDataDeviceLVM removes orphaned LVM structures on a data device
+// from a purged OSD so that ceph-volume can reuse the device.
+func cleanupStaleDataDeviceLVM(executor exec.Executor, devicePath string) error {
+	vgName, err := getExistingCephVG(executor, devicePath)
+	if err != nil || vgName == "" {
+		return nil // No Ceph VG on this device, nothing to clean up
+	}
+
+	logger.Infof("cleaning up stale LVM on data device %s (VG: %s)", devicePath, vgName)
+
+	// List LVs and close any dm-crypt devices before removal
+	lvOutput, err := nsenterLVMCommand(executor, "lvs",
+		"--noheadings", "--separator", "|",
+		"-o", "lv_name,lv_uuid",
+		"--select", fmt.Sprintf("vg_name=%s", vgName),
+	)
+	if err == nil {
+		for _, line := range strings.Split(lvOutput, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "|", 2)
+			if len(parts) < 2 {
+				continue
+			}
+			lvUUID := strings.TrimSpace(parts[1])
+			if lvUUID != "" {
+				// Try to close any dm-crypt device using the LV UUID as name
+				cryptArgs := []string{fmt.Sprintf("--mount=%s", mountNsPath), "--", "dmsetup", "remove", "--force", lvUUID}
+				if _, err := executor.ExecuteCommandWithOutput(nsenterCmd, cryptArgs...); err != nil {
+					logger.Debugf("no dm-crypt device %s to close (expected if not encrypted): %v", lvUUID, err)
+				}
+			}
+		}
+	}
+
+	// Force remove the VG (which also removes all LVs in it)
+	if _, err := nsenterLVMCommand(executor, "vgremove", "-f", vgName); err != nil {
+		return errors.Wrapf(err, "failed to remove stale VG %s on %s", vgName, devicePath)
+	}
+	logger.Infof("removed stale VG %s from data device %s", vgName, devicePath)
+
+	// Remove the PV so the device is completely clean
+	if _, err := nsenterLVMCommand(executor, "pvremove", "-f", devicePath); err != nil {
+		logger.Warningf("failed to remove PV on %s: %v (device may still be usable)", devicePath, err)
 	}
 
 	return nil

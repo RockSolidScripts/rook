@@ -19,6 +19,7 @@ package osd
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -358,6 +359,7 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			continue
 		}
 
+		var skipAvailabilityCheck bool
 		// Ignore device with filesystem signature since c-v inventory
 		// cannot detect that correctly
 		// see: https://tracker.ceph.com/issues/43585
@@ -380,7 +382,9 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 			} else if device.Filesystem == "LVM2_member" && isDeviceExplicitlyRequested(device.Name, desiredDevices) {
 				// Device is an LVM PV but explicitly requested. This happens when a device
 				// has existing Ceph LVM structures (e.g., OSD replacement scenario).
+				// Skip ceph-volume inventory check which rejects devices with existing LVM.
 				logger.Infof("allowing LVM device %q because it is explicitly requested", device.Name)
+				skipAvailabilityCheck = true
 			} else {
 				logger.Infof("skipping device %q because it contains a filesystem %q", device.Name, device.Filesystem)
 				continue
@@ -420,7 +424,19 @@ func getAvailableDevices(context *clusterd.Context, agent *OsdAgent) (*DeviceOsd
 		var err error
 		var isAvailable bool
 		rejectedReason := ""
-		if agent.pvcBacked {
+		if skipAvailabilityCheck {
+			// For explicitly requested LVM devices, ceph-volume inventory
+			// rejects them because of existing LVM structures. Instead, check
+			// if the device is actively used by a running OSD.
+			devPath := filepath.Join("/dev", device.Name)
+			if isDeviceUsedByActiveOSD(context, devPath) {
+				isAvailable = false
+				rejectedReason = "actively used by a running OSD"
+			} else {
+				isAvailable = true
+				logger.Infof("device %q has stale LVM from a purged OSD, will be cleaned up", device.Name)
+			}
+		} else if agent.pvcBacked {
 			block := fmt.Sprintf("/mnt/%s", agent.nodeName)
 			rawOsds, err := GetCephVolumeRawOSDs(context, agent.clusterInfo, agent.clusterInfo.FSID, block, agent.metadataDevice, "", false, true)
 			if err != nil {
@@ -660,6 +676,35 @@ func isDeviceExplicitlyRequested(deviceName string, desiredDevices []DesiredDevi
 		name := strings.TrimPrefix(desired.Name, "/dev/")
 		if name == deviceName || desired.Name == deviceName {
 			return true
+		}
+	}
+	return false
+}
+
+// isDeviceUsedByActiveOSD checks if a device is actively used by a running OSD
+// by querying ceph-volume lvm list and checking the "devices" arrays.
+func isDeviceUsedByActiveOSD(context *clusterd.Context, devicePath string) bool {
+	result, err := callCephVolume(context, "lvm", "list", "--format", "json")
+	if err != nil {
+		logger.Warningf("failed to run ceph-volume lvm list to check device %q: %v", devicePath, err)
+		return false
+	}
+
+	var cvList map[string][]map[string]interface{}
+	if err := json.Unmarshal([]byte(result), &cvList); err != nil {
+		logger.Warningf("failed to parse ceph-volume lvm list output: %v", err)
+		return false
+	}
+
+	for _, osdLVs := range cvList {
+		for _, lv := range osdLVs {
+			if devices, ok := lv["devices"].([]interface{}); ok {
+				for _, d := range devices {
+					if dStr, ok := d.(string); ok && dStr == devicePath {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false
