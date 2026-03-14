@@ -1139,22 +1139,18 @@ func createDBLVInExistingVG(executor exec.Executor, vgName string, dbSizeBytes u
 		logger.Warningf("failed to add ceph.type=db tag to LV %s: %v", lvPath, err)
 	}
 
-	// Create /dev/VG/LV symlink in the container so ceph-volume can find it.
-	// nsenter lvcreate creates the LV in the host mount namespace. The dm device
-	// node is shared, but the /dev/VG/LV symlink only exists in the host's /dev.
-	// ceph-volume's is_lv() checks os.path.exists() on the path, which fails
-	// without this symlink, causing it to fall through to get_ptuuid() which
-	// fails because LVs don't have PARTUUIDs.
-	escapedVG := strings.ReplaceAll(vgName, "-", "--")
-	escapedLV := strings.ReplaceAll(lvName, "-", "--")
-	mapperPath := fmt.Sprintf("/dev/mapper/%s-%s", escapedVG, escapedLV)
-	vgDir := fmt.Sprintf("/dev/%s", vgName)
-	if err := os.MkdirAll(vgDir, 0o755); err != nil {
-		logger.Warningf("failed to create VG directory %s: %v", vgDir, err)
-	} else if err := os.Symlink(mapperPath, lvPath); err != nil && !os.IsExist(err) {
-		logger.Warningf("failed to create LV symlink %s -> %s: %v", lvPath, mapperPath, err)
-	} else {
-		logger.Infof("created LV symlink %s -> %s for container visibility", lvPath, mapperPath)
+	// Create proper device nodes in /dev/VG/ using vgmknodes.
+	// nsenter lvcreate creates the LV in the host mount namespace but the
+	// /dev/VG/LV device node may only exist in the host's /dev. Using
+	// vgmknodes creates real block device nodes (via mknod) rather than
+	// symlinks. This is critical because ceph-volume's setup_device()
+	// calls os.path.realpath() on the --block.db path before looking it
+	// up via "lvs -S lv_path=...". A symlink resolves to /dev/mapper/VG-LV
+	// which doesn't match lvs's lv_path format (/dev/VG/LV), causing the
+	// lookup to fail. A real device node is not resolved by realpath, so
+	// the /dev/VG/LV path is preserved and matches correctly.
+	if _, err := nsenterLVMCommand(executor, "vgmknodes", vgName); err != nil {
+		logger.Warningf("failed to run vgmknodes for VG %s: %v", vgName, err)
 	}
 
 	logger.Infof("created db LV %s for OSD replacement", lvPath)
