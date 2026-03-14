@@ -1012,7 +1012,18 @@ func (a *OsdAgent) removeOrphanedDBLVs(context *clusterd.Context, vgName string)
 			}
 		}
 
+		// LVs with no ceph.osd_id tag are leftovers from failed
+		// previous prepare attempts. Remove them unconditionally.
 		if osdID < 0 {
+			logger.Infof("found tagless orphaned db LV %s, removing it", lvPath)
+			if _, err := nsenterLVMCommand(context.Executor, "lvchange", "-an", lvPath); err != nil {
+				logger.Warningf("failed to deactivate tagless orphaned LV %s: %v", lvPath, err)
+			}
+			if _, err := nsenterLVMCommand(context.Executor, "lvremove", "-f", lvPath); err != nil {
+				logger.Warningf("failed to remove tagless orphaned LV %s: %v", lvPath, err)
+			} else {
+				logger.Infof("successfully removed tagless orphaned db LV %s", lvPath)
+			}
 			continue
 		}
 
@@ -1118,6 +1129,15 @@ func createDBLVInExistingVG(executor exec.Executor, vgName string, dbSizeBytes u
 	}
 
 	lvPath := fmt.Sprintf("/dev/%s/%s", vgName, lvName)
+
+	// Add a ceph.type=db tag so ceph-volume recognizes this LV.
+	// ceph-volume's internal LV listing (Volumes._populate) only includes
+	// LVs with Ceph tags. Without this tag, get_single_lv() won't find
+	// the LV, causing setup_device() to fall through to get_ptuuid()
+	// which fails because LVs don't have PARTUUIDs.
+	if _, err := nsenterLVMCommand(executor, "lvchange", "--addtag", "ceph.type=db", lvPath); err != nil {
+		logger.Warningf("failed to add ceph.type=db tag to LV %s: %v", lvPath, err)
+	}
 
 	// Create /dev/VG/LV symlink in the container so ceph-volume can find it.
 	// nsenter lvcreate creates the LV in the host mount namespace. The dm device
