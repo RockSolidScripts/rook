@@ -286,5 +286,14 @@ func DestroyOSD(context *clusterd.Context, clusterInfo *client.ClusterInfo, id i
 	logger.Infof("%s\n", output)
 	logger.Infof("successfully zapped osd.%d path %q", osdInfo.ID, osdInfo.BlockPath)
 
+	// For non-PVC LVM mode, resolve the block LV path back to the underlying
+	// physical device so that GetReplaceOSDId() can match by device path
+	// during replacement. The LV path (e.g. /dev/ceph-xxx/osd-block-yyy) is
+	// gone after zap+destroy, so we need the device path (e.g. /dev/vdb).
+	if !isPVC && osdInfo.DataDevicePath != "" {
+		logger.Infof("resolved OSD.%d block LV to underlying device %q for replacement", osdInfo.ID, osdInfo.DataDevicePath)
+		osdInfo.BlockPath = osdInfo.DataDevicePath
+	}
+
 	return osdInfo, nil
 }

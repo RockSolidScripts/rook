@@ -1836,6 +1836,117 @@ func TestCephVolumeResultMultiClusterMultiOSD(t *testing.T) {
 	assert.Equal(t, osds[0].UUID, "dbe407e0-c1cb-495e-b30a-02e01de6c8ae")
 }
 
+func TestGetCephVolumeLVMOSDsWithSeparateDB(t *testing.T) {
+	// Simulate ceph-volume lvm list output where each OSD has both a "block"
+	// and a "db" entry. The db LV lives on a shared metadata device (/dev/vdc).
+	// This test verifies that:
+	//  1. BlockPath is set to the block LV path, not the db LV path.
+	//  2. DataDevicePath is populated from the block entry's "devices" field.
+	const fsid = "aaaa-bbbb-cccc-dddd"
+	cvResult := `{
+    "0": [
+        {
+            "devices": ["/dev/vdb"],
+            "lv_name": "osd-block-1111",
+            "lv_path": "/dev/ceph-vg0/osd-block-1111",
+            "lv_size": "<50g",
+            "name": "osd-block-1111",
+            "path": "/dev/ceph-vg0/osd-block-1111",
+            "tags": {
+                "ceph.cluster_fsid": "aaaa-bbbb-cccc-dddd",
+                "ceph.crush_device_class": "ssd",
+                "ceph.osd_fsid": "osd0-fsid",
+                "ceph.type": "block"
+            },
+            "type": "block",
+            "vg_name": "ceph-vg0"
+        },
+        {
+            "devices": ["/dev/vdc"],
+            "lv_name": "osd-db-2222",
+            "lv_path": "/dev/ceph-shared/osd-db-2222",
+            "lv_size": "<3g",
+            "name": "osd-db-2222",
+            "path": "/dev/ceph-shared/osd-db-2222",
+            "tags": {
+                "ceph.cluster_fsid": "aaaa-bbbb-cccc-dddd",
+                "ceph.crush_device_class": "ssd",
+                "ceph.osd_fsid": "osd0-fsid",
+                "ceph.type": "db"
+            },
+            "type": "db",
+            "vg_name": "ceph-shared"
+        }
+    ],
+    "1": [
+        {
+            "devices": ["/dev/vdc"],
+            "lv_name": "osd-db-3333",
+            "lv_path": "/dev/ceph-shared/osd-db-3333",
+            "lv_size": "<3g",
+            "name": "osd-db-3333",
+            "path": "/dev/ceph-shared/osd-db-3333",
+            "tags": {
+                "ceph.cluster_fsid": "aaaa-bbbb-cccc-dddd",
+                "ceph.crush_device_class": "ssd",
+                "ceph.osd_fsid": "osd1-fsid",
+                "ceph.type": "db"
+            },
+            "type": "db",
+            "vg_name": "ceph-shared"
+        },
+        {
+            "devices": ["/dev/vdd"],
+            "lv_name": "osd-block-4444",
+            "lv_path": "/dev/ceph-vg1/osd-block-4444",
+            "lv_size": "<50g",
+            "name": "osd-block-4444",
+            "path": "/dev/ceph-vg1/osd-block-4444",
+            "tags": {
+                "ceph.cluster_fsid": "aaaa-bbbb-cccc-dddd",
+                "ceph.crush_device_class": "ssd",
+                "ceph.osd_fsid": "osd1-fsid",
+                "ceph.type": "block"
+            },
+            "type": "block",
+            "vg_name": "ceph-vg1"
+        }
+    ]
+}`
+
+	executor := &exectest.MockExecutor{}
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+		if command == "stdbuf" {
+			return cvResult, nil
+		}
+		return "", errors.Errorf("unknown command %s %s", command, args)
+	}
+
+	context := &clusterd.Context{Executor: executor}
+	osds, err := GetCephVolumeLVMOSDs(context, &cephclient.ClusterInfo{Namespace: "name"}, fsid, "", false, false)
+	assert.NoError(t, err)
+	require.Len(t, osds, 2)
+
+	// Build a map by ID for order-independent assertions
+	osdByID := map[int]oposd.OSDInfo{}
+	for _, o := range osds {
+		osdByID[o.ID] = o
+	}
+
+	// OSD 0: block entry is first, db entry is second.
+	// Before the fix, BlockPath would be the db LV path (last entry).
+	osd0 := osdByID[0]
+	assert.Equal(t, "/dev/ceph-vg0/osd-block-1111", osd0.BlockPath, "BlockPath must be the block LV, not the db LV")
+	assert.Equal(t, "/dev/vdb", osd0.DataDevicePath, "DataDevicePath must be the underlying data device")
+	assert.Equal(t, "osd0-fsid", osd0.UUID)
+
+	// OSD 1: db entry is first, block entry is second.
+	osd1 := osdByID[1]
+	assert.Equal(t, "/dev/ceph-vg1/osd-block-4444", osd1.BlockPath, "BlockPath must be the block LV, not the db LV")
+	assert.Equal(t, "/dev/vdd", osd1.DataDevicePath, "DataDevicePath must be the underlying data device")
+	assert.Equal(t, "osd1-fsid", osd1.UUID)
+}
+
 func TestSanitizeOSDsPerDevice(t *testing.T) {
 	assert.Equal(t, "1", sanitizeOSDsPerDevice(-1))
 	assert.Equal(t, "1", sanitizeOSDsPerDevice(0))

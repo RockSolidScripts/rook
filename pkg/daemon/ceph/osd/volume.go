@@ -77,9 +77,10 @@ type osdInfoBlock struct {
 }
 
 type osdInfo struct {
-	Name string  `json:"name"`
-	Path string  `json:"path"`
-	Tags osdTags `json:"tags"`
+	Name    string   `json:"name"`
+	Path    string   `json:"path"`
+	Tags    osdTags  `json:"tags"`
+	Devices []string `json:"devices"`
 	// "block" for bluestore
 	Type string `json:"type"`
 }
@@ -1138,6 +1139,7 @@ func GetCephVolumeLVMOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			continue
 		}
 		var osdFSID, osdDeviceClass string
+		var blockDevicePath string
 		for _, osd := range osdInfo {
 			if osd.Tags.ClusterFSID != cephfsid {
 				logger.Infof("skipping osd%d: %q running on a different ceph cluster %q", id, osd.Tags.OSDFSID, osd.Tags.ClusterFSID)
@@ -1146,11 +1148,20 @@ func GetCephVolumeLVMOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 			osdFSID = osd.Tags.OSDFSID
 			osdDeviceClass = osd.Tags.CrushDeviceClass
 
-			// If no lv is specified let's take the one we discovered
+			// If no lv is specified let's take the one we discovered.
+			// Prefer the "block" type LV over "db" or other types so that
+			// BlockPath always points to the data device's block LV, not a
+			// db LV on a shared metadata device.
 			if lv == "" {
-				lvPath = osd.Path
+				if osd.Type == "block" || lvPath == "" {
+					lvPath = osd.Path
+				}
 			}
 
+			// Track the underlying physical device from the block LV entry
+			if osd.Type == "block" && len(osd.Devices) > 0 {
+				blockDevicePath = osd.Devices[0]
+			}
 		}
 
 		if len(osdFSID) == 0 {
@@ -1171,15 +1182,16 @@ func GetCephVolumeLVMOSDs(context *clusterd.Context, clusterInfo *client.Cluster
 		}
 
 		osd := oposd.OSDInfo{
-			ID:            id,
-			Cluster:       "ceph",
-			UUID:          osdFSID,
-			BlockPath:     lvPath,
-			SkipLVRelease: skipLVRelease,
-			LVBackedPV:    lvBackedPV,
-			CVMode:        cvMode,
-			Store:         osdStore,
-			DeviceClass:   osdDeviceClass,
+			ID:             id,
+			Cluster:        "ceph",
+			UUID:           osdFSID,
+			BlockPath:      lvPath,
+			SkipLVRelease:  skipLVRelease,
+			LVBackedPV:     lvBackedPV,
+			CVMode:         cvMode,
+			Store:          osdStore,
+			DeviceClass:    osdDeviceClass,
+			DataDevicePath: blockDevicePath,
 		}
 		osds = append(osds, osd)
 	}

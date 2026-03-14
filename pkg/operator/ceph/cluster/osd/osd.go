@@ -133,6 +133,9 @@ type OSDInfo struct {
 	PVCName          string             `json:"pvcName"`
 	DeviceType       string             `json:"device-type"`
 	CephxStatus      cephv1.CephxStatus `json:"cephxStatus"`
+	// DataDevicePath is the underlying physical device path for the OSD's block LV
+	// (e.g. /dev/vdb). Populated from ceph-volume lvm list "devices" field.
+	DataDevicePath string `json:"data-device-path,omitempty"`
 }
 
 // OrchestrationStatus represents the status of an OSD orchestration
